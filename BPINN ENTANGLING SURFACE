@@ -1,0 +1,218 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from blitz.modules import BayesianLinear
+from blitz.utils import variational_estimator
+
+# Set default data type and seed
+torch.set_default_dtype(torch.float64)
+torch.manual_seed(42)
+
+# Load data
+file_path1 = r"C:\Users\fl5g21\OneDrive - University of Southampton\Desktop\DataFirstBranch.csv"
+file_path2 = r"C:\Users\fl5g21\OneDrive - University of Southampton\Desktop\DataSecondBranch.csv"
+
+data1 = pd.read_csv(file_path1, header=None)
+data2 = pd.read_csv(file_path2, header=None)
+data1.columns = ['x', 'u']
+data2.columns = ['x', 'u']
+
+# Data selection
+def select_data(data, n_points_low, n_points_high, sampling_method='random'):
+    mask_low = data['u'] < 0.1
+    mask_high = (data['u'] >= 0.24) & (data['u'] <= 0.26)
+    if sampling_method == 'random':
+        data_low = data[mask_low].sample(n=min(n_points_low, mask_low.sum()), random_state=42)
+        data_high = data[mask_high].sample(n=min(n_points_high, mask_high.sum()), random_state=42)
+    else:
+        data_low = data[mask_low].iloc[::max(1, len(data[mask_low]) // n_points_low)]
+        data_high = data[mask_high].iloc[::max(1, len(data[mask_high]) // n_points_high)]
+    return pd.concat([data_low, data_high])
+
+# Standard scaler
+github = None
+class StandardScaler:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+    def fit(self, tensor):
+        self.mean = tensor.mean(0, keepdim=True)
+        self.std = tensor.std(0, unbiased=False, keepdim=True)
+    def transform(self, tensor):
+        return (tensor - self.mean) / self.std
+    def inverse_transform(self, tensor):
+        return tensor * self.std + self.mean
+
+# Bayesian PINN model
+default_prior = dict(prior_sigma_1=100.0, prior_sigma_2=100.0, prior_pi=0.5)
+@variational_estimator
+class BayesianPINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.Sequential(
+            BayesianLinear(1, 128, **default_prior), nn.Tanh(),
+            BayesianLinear(128, 128, **default_prior), nn.Tanh(),
+            BayesianLinear(128, 64, **default_prior), nn.Tanh(),
+            BayesianLinear(64, 1, **default_prior)
+        )
+    def forward(self, u):
+        return self.layers(u)
+
+# Sampling for residuals
+def sample_u_intermediate(u_min, u_max, n_points):
+    return torch.linspace(u_min, u_max, n_points).reshape(-1, 1)
+
+# Compute residual
+def compute_residual(u_res, model, scaler_X, scaler_y):
+    u_scaled = scaler_X.transform(u_res.requires_grad_(True))
+    x_scaled = model(u_scaled)
+    dx_du = torch.autograd.grad(x_scaled, u_scaled, grad_outputs=torch.ones_like(x_scaled), create_graph=True)[0]
+    d2x_du2 = torch.autograd.grad(dx_du, u_scaled, grad_outputs=torch.ones_like(dx_du), create_graph=True)[0]
+    u_orig = scaler_X.inverse_transform(u_scaled)
+    x_orig = scaler_y.inverse_transform(x_scaled)
+    dx_du_orig = dx_du * (scaler_y.std / scaler_X.std)
+    d2x_du2_orig = d2x_du2 * (scaler_y.std / scaler_X.std**2)
+    u, x, x1, x2 = u_orig, x_orig, dx_du_orig, d2x_du2_orig
+    return ((u-1)*u*(u+1)**3 * x1**3 + 0.5*(u+1)*x**2*(2*u*(u+1)*x2 + (5*u-1)*x1) + x**3)
+
+# Physics-informed loss
+def physics_informed_loss(model, u, y_true, branch, scaler_X, scaler_y, weights):
+    x_pred = model(u)
+    mse = nn.MSELoss()(x_pred, y_true)
+    physics = torch.tensor(0.0, dtype=torch.float64)
+    if branch == 1:
+        u0 = torch.tensor([[0.0]], dtype=torch.float64)
+        umax = torch.tensor([[0.0377816]], dtype=torch.float64, requires_grad=True)
+        unew = torch.tensor([[0.2499945935025199]], dtype=torch.float64)
+        u0s = scaler_X.transform(u0)
+        umaxs = scaler_X.transform(umax)
+        unews = scaler_X.transform(unew)
+        x0, xmax, xnew = model(u0s), model(umaxs), model(unews)
+        dxdumax = torch.autograd.grad(xmax, umaxs, grad_outputs=torch.ones_like(xmax), create_graph=True, allow_unused=True)[0]
+        dxdumax = dxdumax * (scaler_y.std/scaler_X.std) if dxdumax is not None else torch.tensor(0.0)
+        physics = (weights['w1']*(scaler_y.inverse_transform(x0)-1.660046)**2 +
+                   weights['w2']*(scaler_y.inverse_transform(xmax)-1.70253)**2 +
+                   weights['w3']*dxdumax**2 +
+                   weights['w_new']*(scaler_y.inverse_transform(xnew)-1.0034)**2).mean()
+    else:
+        u0 = torch.tensor([[0.0]], dtype=torch.float64)
+        ui = torch.tensor([[0.25]], dtype=torch.float64)
+        u0s, uis = scaler_X.transform(u0), scaler_X.transform(ui)
+        x0, xi = model(u0s), model(uis)
+        physics = (weights['w1']*(scaler_y.inverse_transform(x0)-0.424878)**2 +
+                   weights['w2']*(scaler_y.inverse_transform(xi)-1.0)**2).mean()
+    ures = sample_u_intermediate(0.115, 0.225, 100)
+    res_loss = torch.mean(compute_residual(ures, model, scaler_X, scaler_y)**2)
+    return mse + physics + weights.get('w_res',1.0)*res_loss, ures
+
+# Training function
+def train_bayesian_pinn(data, branch, n_low, n_high, epochs=1000, lr=0.001, weights=None, num_samples=5, kl_weight=1e-6):
+    sd = select_data(data, n_low, n_high)
+    X_train = torch.tensor(sd['u'].values, dtype=torch.float64).reshape(-1,1)
+    y_train = torch.tensor(sd['x'].values, dtype=torch.float64).reshape(-1,1)
+    X_val = torch.tensor(data['u'].values, dtype=torch.float64).reshape(-1,1)
+    y_val = torch.tensor(data['x'].values, dtype=torch.float64).reshape(-1,1)
+    sx, sy = StandardScaler(), StandardScaler()
+    sx.fit(X_train); sy.fit(y_train)
+    X_tr_s, y_tr_s = sx.transform(X_train), sy.transform(y_train)
+    X_val_s = sx.transform(X_val)
+    model = BayesianPINN(); opt = optim.Adam(model.parameters(), lr=lr)
+    for ep in range(epochs):
+        opt.zero_grad(); tot=0
+        for _ in range(num_samples):
+            l,_ = physics_informed_loss(model, X_tr_s, y_tr_s, branch, sx, sy, weights); tot+=l
+        tot = tot/num_samples + kl_weight*model.nn_kl_divergence()
+        tot.backward(); opt.step()
+        if (ep+1)%100==0: print(f"Epoch [{ep+1}/{epochs}], Loss: {tot.item():.6f}")
+    model.eval()
+    with torch.no_grad():
+        preds=[]
+        for _ in range(num_samples*20): preds.append(sy.inverse_transform(model(X_val_s)).numpy())
+        arr=np.array(preds)
+        y_mean=torch.tensor(arr.mean(axis=0)); y_std=torch.tensor(arr.std(axis=0))
+    mse = torch.mean((y_mean - y_val)**2).item()
+    r2  = 1 - (torch.sum((y_val-y_mean)**2)/torch.sum((y_val-torch.mean(y_val))**2)).item()
+    print(f"\nBranch {branch} - MSE: {mse:.6f}, R2: {r2:.6f}")
+    return model, sx, sy, X_train, y_train, X_val, y_val, y_mean, y_std, r2, mse
+
+# Plot residuals
+def plot_residual(model, scaler_X, scaler_y, branch_num):
+    u_plot = torch.linspace(0.115,0.225,1000).reshape(-1,1).requires_grad_(True)
+    res = compute_residual(u_plot, model, scaler_X, scaler_y)
+    plt.figure(figsize=(8,5))
+    plt.plot(u_plot.detach().numpy(), res.detach().numpy(), label='Residual')
+    plt.xlabel('u'); plt.ylabel('Residual'); plt.title(f'Branch {branch_num} Residual')
+    plt.legend(); plt.show()
+
+# Plot uncertainty analysis
+def plot_uncertainty_analysis(results, branch_num):
+    model, sx, sy, X_val, y_val_pred, y_std = results['model'], results['scaler_X'], results['scaler_y'], results['y_val'], results['y_val_pred'], results['y_val_std']
+    plt.figure(figsize=(8,5))
+    plt.plot(X_val.detach().numpy(), y_std.numpy(), '.' , label='Std Dev')
+    plt.xlabel('u'); plt.ylabel('Uncertainty'); plt.title(f'Branch {branch_num} Uncertainty')
+    plt.legend(); plt.show()
+
+# Validate uncertainty
+def validate_uncertainty(results, branch_num):
+    y_true = results['y_val'].numpy().flatten()
+    y_pred = results['y_val_pred'].numpy().flatten()
+    y_std  = results['y_val_std'].numpy().flatten()
+    within = np.abs(y_true-y_pred) < 2*y_std
+    picp = np.mean(within)
+    mpiw = np.mean(2*y_std)
+    corr = np.corrcoef(np.abs(y_true-y_pred), y_std)[0,1]
+    print(f"Branch {branch_num} - PICP: {picp:.3f}, MPIW: {mpiw:.3f}, Corr: {corr:.3f}")
+
+# PCC analysis
+def plot_PCC_analysis(model, scaler_X, scaler_y, u_min, u_max, num_points=200, num_samples=1000, epsilon=1e-12):
+    u_range = torch.linspace(u_min, u_max, num_points).reshape(-1,1).requires_grad_(True)
+    # Ensemble preds
+    model.train(); preds=[]
+    for _ in range(num_samples): preds.append(scaler_y.inverse_transform(model(scaler_X.transform(u_range))).detach().numpy())
+    preds = np.array(preds); var = preds.var(axis=0).flatten()
+    # Residuals
+    res = compute_residual(u_range, model, scaler_X, scaler_y)
+    dres = torch.autograd.grad(res, u_range, grad_outputs=torch.ones_like(res), create_graph=True)[0]
+    I = (dres.detach().numpy().flatten())**2
+    # Plot normalized
+    u_np = u_range.detach().numpy().flatten()
+    plt.figure(figsize=(8,5))
+    plt.plot(u_np, I/ (I.max()+epsilon), label='I')
+    plt.plot(u_np, var/ (var.max()+epsilon), label='σ²')
+    plt.title('Normalized I and σ²'); plt.legend(); plt.show()
+    plt.figure(figsize=(8,5))
+    plt.plot(u_np, I/(var+epsilon), label='Local PCC')
+    plt.title('Local PCC'); plt.legend(); plt.show()
+    I_int = np.trapz(I, u_np); v_int=np.trapz(var, u_np)
+    print(f"Integrated PCC = {I_int/(v_int+epsilon):.4f}")
+
+# Main execution
+if __name__ == '__main__':
+    n_low, n_high = 50, 10
+    w1 = {'w1':1,'w2':0.5,'w3':1,'w_new':1,'w_res':0.05}
+    w2 = {'w1':1,'w2':0.5,'w_res':0.05}
+    epochs, lr, ns, klw = 1000, 0.001, 5, 0.1
+
+    print("=== Training Branch 1 ===")
+    b1 = train_bayesian_pinn(data1,1,n_low,n_high,epochs,lr,w1,ns,klw)
+    print("=== Training Branch 2 ===")
+    b2 = train_bayesian_pinn(data2,2,n_low,n_high,epochs,lr,w2,ns,klw)
+
+    # Plotting and analysis
+    plot_residual(b1[0], b1[1], b1[2], branch_num=1)
+    plot_residual(b2[0], b2[1], b2[2], branch_num=2)
+
+    plot_uncertainty_analysis({'model':b1[0],'scaler_X':b1[1],'scaler_y':b1[2],'y_val':b1[6],'y_val_pred':b1[7],'y_val_std':b1[8]}, 1)
+    validate_uncertainty({'y_val':b1[6],'y_val_pred':b1[7],'y_val_std':b1[8]}, 1)
+
+    plot_uncertainty_analysis({'model':b2[0],'scaler_X':b2[1],'scaler_y':b2[2],'y_val':b2[6],'y_val_pred':b2[7],'y_val_std':b2[8]}, 2)
+    validate_uncertainty({'y_val':b2[6],'y_val_pred':b2[7],'y_val_std':b2[8]}, 2)
+
+    print("=== PCC Analysis Branch 1 ===")
+    plot_PCC_analysis(b1[0],b1[1],b1[2],u_min=b1[5].min().item(),u_max=b1[5].max().item())
+    print("=== PCC Analysis Branch 2 ===")
+    plot_PCC_analysis(b2[0],b2[1],b2[2],u_min=b2[5].min().item(),u_max=b2[5].max().item())
+    print("Done.")
