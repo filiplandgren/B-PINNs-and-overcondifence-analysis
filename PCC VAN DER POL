@@ -1,0 +1,357 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+
+torch.set_default_dtype(torch.float64)
+torch.manual_seed(42)
+
+###############################################
+# 1. Generate true solution (Van der Pol)
+###############################################
+def van_der_pol(t, state, mu=1.0):
+    u, v = state  # v = u'
+    return [v, mu*(1 - u**2)*v - u]
+
+t_span = [0, 7]
+initial_state = [2.0, 0.0]
+mu = 1.0
+t_eval = np.linspace(t_span[0], t_span[1], 1000)
+sol = solve_ivp(van_der_pol, t_span, initial_state, args=(mu,), t_eval=t_eval, method='RK45')
+t_true = sol.t
+u_true = sol.y[0]
+
+###############################################
+# 2. Bayesian PINN
+###############################################
+from blitz.modules import BayesianLinear
+from blitz.utils import variational_estimator
+
+@variational_estimator
+class BayesianPINN(nn.Module):
+    def __init__(self, hidden_layers=3, neurons=50, 
+                 prior_sigma_1=0.1, prior_sigma_2=0.1, prior_pi=0.5):
+        super(BayesianPINN, self).__init__()
+        layers = []
+        in_dim = 1
+        layers.append(BayesianLinear(in_dim, neurons,
+                                     prior_sigma_1=prior_sigma_1,
+                                     prior_sigma_2=prior_sigma_2,
+                                     prior_pi=prior_pi))
+        layers.append(nn.Tanh())
+        for _ in range(hidden_layers-1):
+            layers.append(BayesianLinear(neurons, neurons,
+                                         prior_sigma_1=prior_sigma_1,
+                                         prior_sigma_2=prior_sigma_2,
+                                         prior_pi=prior_pi))
+            layers.append(nn.Tanh())
+        layers.append(BayesianLinear(neurons, 1,
+                                     prior_sigma_1=prior_sigma_1,
+                                     prior_sigma_2=prior_sigma_2,
+                                     prior_pi=prior_pi))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+###############################################
+# 3. Losses: PDE, IC, Data
+###############################################
+def PDE_loss(model, t, mu=1.0):
+    u = model(t)
+    du = torch.autograd.grad(u, t, torch.ones_like(u), create_graph=True)[0]
+    d2u = torch.autograd.grad(du, t, torch.ones_like(du), create_graph=True)[0]
+    residual = d2u - mu*(1 - u**2)*du + u
+    return torch.mean(residual**2)
+
+def IC_loss(model):
+    t0 = torch.tensor([[0.0]], dtype=torch.float64, requires_grad=True)
+    u0 = model(t0)
+    du0 = torch.autograd.grad(u0, t0, torch.ones_like(u0), create_graph=True)[0]
+    return ((u0 - 2.0)**2 + du0**2).mean()
+
+# (Optional) Data
+num_data_points = 20
+t_data_np = np.linspace(t_span[0], t_span[1], num_data_points)
+u_data_np = np.interp(t_data_np, t_true, u_true)
+t_data = torch.tensor(t_data_np, dtype=torch.float64, requires_grad=True).unsqueeze(-1)
+u_data = torch.tensor(u_data_np, dtype=torch.float64).unsqueeze(-1)
+
+def data_loss(model, t_data, u_data):
+    u_pred = model(t_data)
+    return torch.mean((u_pred - u_data)**2)
+
+###############################################
+# 4. Train
+###############################################
+t_colloc_np = np.linspace(t_span[0], t_span[1], 200)
+t_colloc = torch.tensor(t_colloc_np, dtype=torch.float64, requires_grad=True).unsqueeze(-1)
+
+model = BayesianPINN()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+epochs = 1400
+lambda_pde = 1.0
+lambda_ic = 1.0
+lambda_data = 1.0
+num_samples_posterior = 5
+kl_weight = 1e-3
+
+for epoch in range(epochs):
+    optimizer.zero_grad()
+    total_loss = 0.0
+    for _ in range(num_samples_posterior):
+        l_pde = PDE_loss(model, t_colloc, mu)
+        l_ic = IC_loss(model)
+        l_data = data_loss(model, t_data, u_data)
+        loss = lambda_data * l_data + lambda_pde * l_pde + lambda_ic * l_ic
+        total_loss += loss
+    total_loss /= num_samples_posterior
+    kl = model.nn_kl_divergence()
+    total_loss = total_loss + kl_weight * kl
+    total_loss.backward()
+    optimizer.step()
+    
+    if (epoch+1) % 200 == 0:
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss.item():.6f}, PDE: {l_pde.item():.6f}, IC: {l_ic.item():.6f}, Data: {l_data.item():.6f}, KL: {kl.item():.6f}")
+
+###############################################
+# 5. Predictions
+###############################################
+with torch.no_grad():
+    t_test_np = np.linspace(t_span[0], t_span[1], 500)
+    t_test = torch.tensor(t_test_np, dtype=torch.float64).unsqueeze(-1)
+    
+    ensemble_size = 200
+    preds = []
+    model.train()  # stochastic forward
+    for _ in range(ensemble_size):
+        preds.append(model(t_test).cpu().numpy())
+    model.eval()
+
+preds = np.array(preds)  # (ensemble_size, num_points, 1)
+mean_pred = np.mean(preds, axis=0).flatten()
+var_pred = np.var(preds, axis=0).flatten()
+
+###############################################
+# 6. Operator-based I(t)
+###############################################
+def compute_residual(t, model, mu=1.0):
+    u = model(t)
+    du = torch.autograd.grad(u, t, torch.ones_like(u), create_graph=True)[0]
+    d2u = torch.autograd.grad(du, t, torch.ones_like(du), create_graph=True)[0]
+    residual = d2u - mu*(1 - u**2)*du + u
+    return residual
+
+###############################################
+# 7. Original PCC with local PCC, normalizations
+###############################################
+def operator_based_PCC_analysis(model, t_min, t_max, num_points=200, num_samples=1000, eps=1e-12, mu=1.0):
+    # Evaluate I(t) as derivative of residual
+    t_range = torch.linspace(t_min, t_max, num_points).reshape(-1,1)
+    t_range.requires_grad_(True)
+
+    # Ensemble for variance
+    model.train()
+    preds_list = []
+    for _ in range(num_samples):
+        pred = model(t_range)
+        preds_list.append(pred.detach().cpu().numpy())
+    model.eval()
+    preds_arr = np.array(preds_list)
+    sigma2 = np.var(preds_arr, axis=0).flatten()
+
+    # Compute residual derivative
+    residual = compute_residual(t_range, model, mu)
+    dR_dt = torch.autograd.grad(residual, t_range, 
+                                grad_outputs=torch.ones_like(residual), 
+                                create_graph=True)[0]
+    I_values = (dR_dt**2).detach().cpu().numpy().flatten()
+
+    t_range_np = t_range.detach().cpu().numpy().flatten()
+    I_integral = np.trapz(I_values, t_range_np)
+    sigma2_integral = np.trapz(sigma2, t_range_np)
+    PCC_original = I_integral / (sigma2_integral + eps)
+
+    # Max-based normalization
+    I_max = np.max(I_values) + eps
+    s_max = np.max(sigma2) + eps
+    I_norm_max = I_values / I_max
+    sigma2_norm_max = sigma2 / s_max
+    PCC_max = (np.trapz(I_norm_max, t_range_np) / 
+               (np.trapz(sigma2_norm_max, t_range_np) + eps))
+
+    # "Physics-based" normalization (like your code)
+    S = I_integral / (sigma2_integral + eps)
+    I_norm_phys = I_values / (I_values + S * sigma2 + eps)
+    sigma2_norm_phys = (S * sigma2) / (I_values + S * sigma2 + eps)
+    PCC_phys = (np.trapz(I_norm_phys, t_range_np) / 
+                (np.trapz(sigma2_norm_phys, t_range_np) + eps))
+
+    # Local PCC
+    local_pcc = I_values / (sigma2 + eps)
+
+    return {
+        't': t_range_np,
+        'I_values': I_values,
+        'sigma2': sigma2,
+        'PCC_original': PCC_original,
+        'I_norm_max': I_norm_max,
+        'sigma2_norm_max': sigma2_norm_max,
+        'PCC_max': PCC_max,
+        'I_norm_phys': I_norm_phys,
+        'sigma2_norm_phys': sigma2_norm_phys,
+        'PCC_phys': PCC_phys,
+        'local_pcc': local_pcc
+    }
+
+###############################################
+# 8. Hessian-based approach
+###############################################
+def get_flat_params(model):
+    return torch.cat([p.view(-1) for p in model.parameters()])
+
+def PDE_loss_wrapper(params, model, t_colloc, mu=1.0):
+    # Insert 'params' back into model
+    idx = 0
+    with torch.no_grad():
+        for p in model.parameters():
+            n = p.numel()
+            p.copy_(params[idx:idx+n].view(p.shape))
+            idx += n
+    return PDE_loss(model, t_colloc, mu)
+
+def compute_full_Hessian(model, t_colloc, mu=1.0):
+    params = get_flat_params(model).clone().requires_grad_(True)
+    # Hessian of PDE_loss_wrapper wrt params
+    H = torch.autograd.functional.hessian(
+        lambda p: PDE_loss_wrapper(p, model, t_colloc, mu),
+        params
+    )
+    return H
+
+def grad_f_x(model, x):
+    u = model(x)
+    grads = torch.autograd.grad(u, list(model.parameters()), 
+                                retain_graph=True, create_graph=True, allow_unused=True)
+    # Replace None with zero
+    grads = [g if g is not None else torch.zeros_like(p) for p,g in zip(model.parameters(), grads)]
+    return torch.cat([g.view(-1) for g in grads])
+
+def compute_Ih_values(model, t_points, H):
+    Ih_list = []
+    for x in t_points:
+        x_t = x.view(1,1)
+        v = grad_f_x(model, x_t)  # shape (N,)
+        val = v.unsqueeze(0) @ (H @ v.unsqueeze(1))
+        Ih_list.append(val.item())
+    return np.array(Ih_list)
+
+###############################################
+# 9. Compute Hessian-based I_h(t)
+###############################################
+print("Computing Hessian. This can be expensive for large networks.")
+H = compute_full_Hessian(model, t_colloc, mu)
+H = H.detach()  # shape (N, N)
+H_np = H.cpu().numpy()
+
+# Evaluate at a chosen set of times (like 200 points)
+t_hess_np = np.linspace(t_span[0], t_span[1], 200)
+t_hess_t = torch.tensor(t_hess_np, dtype=torch.float64)
+Ih_vals = compute_Ih_values(model, t_hess_t, H)
+
+# Also get sigma^2 by interpolating var_pred or re-sampling:
+sigma2_hess = np.interp(t_hess_np, t_test_np, var_pred)
+
+# Basic integrated PCC
+eps = 1e-12
+Ih_area = np.trapz(Ih_vals, t_hess_np)
+sigma2_hess_area = np.trapz(sigma2_hess, t_hess_np)
+PCC_hessian = Ih_area / (sigma2_hess_area + eps)
+
+# For local ratio
+local_pcc_hess = Ih_vals / (sigma2_hess + eps)
+
+# Optionally do max-normalization
+Ih_max = np.max(Ih_vals) + eps
+sig2h_max = np.max(sigma2_hess) + eps
+Ih_vals_max = Ih_vals / Ih_max
+sigma2_hess_max = sigma2_hess / sig2h_max
+
+###############################################
+# 10. Operator-based results and plots
+###############################################
+op_results = operator_based_PCC_analysis(model, t_min=t_test_np.min(), t_max=t_test_np.max(),
+                                         num_points=200, num_samples=1000, eps=1e-12, mu=mu)
+
+t_op = op_results['t']
+I_op = op_results['I_values']
+sig2_op = op_results['sigma2']
+PCC_orig = op_results['PCC_original']
+I_op_max = op_results['I_norm_max']
+sig2_op_max = op_results['sigma2_norm_max']
+PCC_max_op = op_results['PCC_max']
+I_op_phys = op_results['I_norm_phys']
+sig2_op_phys = op_results['sigma2_norm_phys']
+PCC_phys_op = op_results['PCC_phys']
+local_pcc_op = op_results['local_pcc']
+
+print(f"\nOperator-based PCC (integrated) = {PCC_orig:.4f}")
+print(f"Operator-based PCC (max-based)  = {PCC_max_op:.4f}")
+print(f"Operator-based PCC (phys-based) = {PCC_phys_op:.4f}")
+
+print(f"Hessian-based PCC (integrated)  = {PCC_hessian:.4f}")
+
+###############################################
+# 11. Plot final results
+###############################################
+# A) True vs B-PINN
+plt.figure(figsize=(8,5))
+plt.plot(t_true, u_true, 'k-', label='True Solution')
+plt.plot(t_test_np, mean_pred, 'r--', label='B-PINN Mean Prediction')
+plt.fill_between(t_test_np, mean_pred - 2*np.sqrt(var_pred),
+                 mean_pred + 2*np.sqrt(var_pred), color='red', alpha=0.2, label='±2σ')
+plt.scatter(t_data_np, u_data_np, color='blue', label='Data Points', zorder=5)
+plt.xlabel('t')
+plt.ylabel('u(t)')
+plt.title('Van der Pol: True vs Bayesian PINN Prediction')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# B) Original I(t) vs sigma^2(t)
+plt.figure(figsize=(8,5))
+plt.plot(t_op, I_op, 'r-', label='I(t)')
+plt.plot(t_op, sig2_op, 'b-', label='σ²(t)')
+plt.xlabel('t')
+plt.ylabel('Value')
+plt.title('Original I(t) and σ²(t) vs t')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# C) Max-based normalization (operator-based)
+plt.figure(figsize=(8,5))
+plt.plot(t_op, I_op_max, 'r-', label='Max-normalized I(t)')
+plt.plot(t_op, sig2_op_max, 'b-', label='Max-normalized σ²(t)')
+plt.xlabel('t')
+plt.ylabel('Normalized Value')
+plt.title('Max-based Normalization: I(t) and σ²(t) vs t')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# D) Local PCC = I(t)/σ²(t)
+plt.figure(figsize=(8,5))
+plt.plot(t_op, local_pcc_op, 'm-', label='Local PCC = I(t)/σ²(t)')
+plt.xlabel('t')
+plt.ylabel('Local PCC')
+plt.title('Local PCC (Original) vs t')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
