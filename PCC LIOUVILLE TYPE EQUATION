@@ -1,0 +1,300 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from scipy.integrate import solve_bvp
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from scipy.stats import pearsonr
+
+# Ensure double precision
+torch.set_default_dtype(torch.float64)
+
+###############################################
+# 1. Solve the ODE with solve_bvp to get "true" data
+###############################################
+# ODE: u''(x) + e^{u(x)} = 0, u(0)=0, u(1)=0
+
+def ode_system(x, y):
+    # y[0] = u(x), y[1] = u'(x)
+    # u''(x) = -e^{u(x)}
+    return np.array([y[1], -np.exp(y[0])])
+
+def bc(ya, yb):
+    # ya = [u(0), u'(0)], yb = [u(1), u'(1)]
+    # BC: u(0)=0, u(1)=0
+    return np.array([ya[0], yb[0]])
+
+x_init = np.linspace(0, 1, 50)
+y_init = np.zeros((2, x_init.size))
+sol = solve_bvp(ode_system, bc, x_init, y_init)
+
+x_true = sol.x
+u_true = sol.y[0]
+
+###############################################
+# 2. Create a Bayesian PINN
+###############################################
+from blitz.modules import BayesianLinear
+from blitz.utils import variational_estimator
+
+@variational_estimator
+class BayesianPINN(nn.Module):
+    def __init__(self, hidden_layers=3, neurons=50, prior_sigma_1=0.1, prior_sigma_2=0.1, prior_pi=0.5):
+        super(BayesianPINN, self).__init__()
+        
+        # Bayesian network layers
+        layers = []
+        in_dim = 1
+        # Input layer
+        layers.append(BayesianLinear(in_dim, neurons, 
+                                     prior_sigma_1=prior_sigma_1,
+                                     prior_sigma_2=prior_sigma_2,
+                                     prior_pi=prior_pi))
+        layers.append(nn.Tanh())
+        # Hidden layers
+        for _ in range(hidden_layers-1):
+            layers.append(BayesianLinear(neurons, neurons,
+                                         prior_sigma_1=prior_sigma_1,
+                                         prior_sigma_2=prior_sigma_2,
+                                         prior_pi=prior_pi))
+            layers.append(nn.Tanh())
+        # Output layer
+        layers.append(BayesianLinear(neurons, 1,
+                                     prior_sigma_1=prior_sigma_1,
+                                     prior_sigma_2=prior_sigma_2,
+                                     prior_pi=prior_pi))
+        
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+###############################################
+# 3. Define loss functions for PDE and BCs
+###############################################
+def PDE_loss(model, x):
+    # PDE: u''(x) + e^{u(x)}=0
+    u = model(x)
+    du = torch.autograd.grad(u, x, torch.ones_like(u), create_graph=True)[0]
+    d2u = torch.autograd.grad(du, x, torch.ones_like(du), create_graph=True)[0]
+    residual = d2u + torch.exp(u)
+    return torch.mean(residual**2)
+
+def BC_loss(model):
+    # u(0)=0, u(1)=0
+    x0 = torch.tensor([[0.0]], dtype=torch.float64, requires_grad=True)
+    x1 = torch.tensor([[1.0]], dtype=torch.float64, requires_grad=True)
+    u0 = model(x0)
+    u1 = model(x1)
+    return (u0**2 + u1**2).mean()
+
+# Optional: Data loss if we have a few "data" points from the true solution.
+num_data_points = 5
+x_data_np = np.linspace(0, 1, num_data_points)
+u_data_np = np.interp(x_data_np, x_true, u_true)
+x_data = torch.tensor(x_data_np, dtype=torch.float64, requires_grad=True).unsqueeze(-1)
+u_data = torch.tensor(u_data_np, dtype=torch.float64).unsqueeze(-1)
+
+def data_loss(model, x_data, u_data):
+    u_pred = model(x_data)
+    return torch.mean((u_pred - u_data)**2)
+
+###############################################
+# 4. Training the Bayesian PINN
+###############################################
+# Collocation points for PDE (to enforce PDE everywhere)
+x_colloc_np = np.linspace(0,1,100)
+x_colloc = torch.tensor(x_colloc_np, dtype=torch.float64, requires_grad=True).unsqueeze(-1)
+    
+model = BayesianPINN()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+epochs = 4000
+lambda_pde = 100.0
+lambda_bc = 100.0
+lambda_data = 1.0
+num_samples_posterior = 5  # number of stochastic forward passes per epoch
+kl_weight = 1e-3           # weighting for KL divergence
+
+for epoch in range(epochs):
+    optimizer.zero_grad()
+    total_loss = 0.0
+    # Multiple samples for variational inference
+    for _ in range(num_samples_posterior):
+        l_pde = PDE_loss(model, x_colloc)
+        l_bc = BC_loss(model)
+        l_data = data_loss(model, x_data, u_data)
+        loss = lambda_data*l_data + lambda_pde*l_pde + lambda_bc*l_bc
+        total_loss += loss
+    total_loss /= num_samples_posterior
+    kl = model.nn_kl_divergence()
+    total_loss = total_loss + kl_weight * kl
+    total_loss.backward()
+    optimizer.step()
+    
+    if (epoch+1) % 200 == 0:
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss.item():.6f}, PDE: {l_pde.item():.6f}, BC: {l_bc.item():.6f}, Data: {l_data.item():.6f}, KL: {kl.item():.6f}")
+
+###############################################
+# 5. Compute Predictions and Uncertainty from the Trained Model
+###############################################
+# Take multiple forward passes to estimate the mean and variance
+with torch.no_grad():
+    x_test_np = np.linspace(0,1,200)
+    x_test = torch.tensor(x_test_np, dtype=torch.float64).unsqueeze(-1)
+    
+    ensemble_size = 200
+    preds = []
+    model.train()  # use train mode for stochastic forward passes
+    for _ in range(ensemble_size):
+        preds.append(model(x_test).cpu().numpy())
+    model.eval()  # revert to evaluation mode
+    
+preds = np.array(preds)  # shape: (ensemble_size, num_points, 1)
+mean_pred = np.mean(preds, axis=0).flatten()
+var_pred = np.var(preds, axis=0).flatten()
+
+###############################################
+# 6. Compute PCC
+###############################################
+# For our PDE, u''(x) + e^{u(x)}=0, we define:
+# I(x) = [d/du (e^{u(x)})]^2 = (e^{u(x)})^2 = e^{2*u(x)}
+# We compute I(x) using the true solution as a stable reference.
+u_interp = np.interp(x_test_np, x_true, u_true)
+I_values = np.exp(2 * u_interp)
+
+dx = x_test_np[1] - x_test_np[0]
+I_integral = np.trapz(I_values, x_test_np)
+var_integral = np.trapz(var_pred, x_test_np)
+PCC = I_integral / var_integral if var_integral > 1e-12 else np.inf
+
+print("\nPCC:", PCC)
+
+###############################################
+# 7. Plot Results: True vs. Prediction, Uncertainty, and I(x) vs σ²(x)
+###############################################
+# Plot True vs. Bayesian PINN Prediction
+plt.figure(figsize=(8,5))
+plt.plot(x_true, u_true, 'k-', label='True Solution')
+plt.plot(x_test_np, mean_pred, 'r--', label='B-PINN Mean Prediction')
+plt.fill_between(x_test_np,
+                 mean_pred - 2*np.sqrt(var_pred),
+                 mean_pred + 2*np.sqrt(var_pred),
+                 color='red', alpha=0.2, label='±2σ')
+plt.scatter(x_data_np, u_data_np, color='blue', label='Data Points', zorder=5)
+plt.xlabel('x')
+plt.ylabel('u(x)')
+plt.title('True vs Bayesian PINN Prediction')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Histogram of Normalized Prediction Errors
+plt.figure(figsize=(8,5))
+normalized_errors = (mean_pred - u_interp) / (np.sqrt(var_pred) + 1e-12)
+plt.hist(normalized_errors, bins=20, density=True, alpha=0.7, color='orange', edgecolor='black')
+plt.xlabel('Normalized Error')
+plt.ylabel('Density')
+plt.title('Histogram of Normalized Prediction Errors')
+plt.grid(True)
+plt.show()
+
+# Original Scatter Plot: I(x) vs σ²(x)
+plt.figure(figsize=(8,5))
+plt.scatter(I_values, var_pred, color='blue', edgecolor='black', alpha=0.7)
+plt.xlabel('I(x) - Physical Information Density')
+plt.ylabel('σ²(x) - Predictive Variance')
+plt.title('I(x) vs σ²(x)')
+plt.grid(True)
+plt.show()
+
+###############################################
+# 8. New Diagnostics: Normalized Plots, Local PCC, and Binned Statistics
+###############################################
+epsilon = 1e-12  # small number to avoid division by zero
+
+# (A) Normalize I(x) and σ²(x) for comparison
+I_norm = I_values / np.max(I_values)
+sigma2_norm = var_pred / np.max(var_pred)
+
+plt.figure(figsize=(10,6))
+plt.plot(x_test_np, I_norm, label="Normalized I(x)", color="red")
+plt.plot(x_test_np, sigma2_norm, label="Normalized σ²(x)", color="blue")
+plt.xlabel("x")
+plt.ylabel("Normalized Value")
+plt.title("Normalized I(x) and σ²(x) vs x")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# (B) Local PCC: the pointwise ratio I(x)/σ²(x)
+local_PCC = I_values / (var_pred + epsilon)
+plt.figure(figsize=(10,6))
+plt.plot(x_test_np, local_PCC, 'm-', label="Local PCC (I(x)/σ²(x))")
+plt.xlabel("x")
+plt.ylabel("Local PCC")
+plt.title("Local PCC vs x")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# (C) Binned Statistics: Average σ²(x) as a function of binned I(x)
+bins = np.linspace(np.min(I_values), np.max(I_values), 20)
+bin_indices = np.digitize(I_values, bins)
+I_bin_avg = [np.mean(I_values[bin_indices == i]) for i in range(1, len(bins))]
+sigma2_bin_avg = [np.mean(var_pred[bin_indices == i]) for i in range(1, len(bins))]
+
+plt.figure(figsize=(8,6))
+plt.scatter(I_bin_avg, sigma2_bin_avg, c="purple", marker="o")
+plt.xlabel("Binned I(x)")
+plt.ylabel("Average σ²(x)")
+plt.title("Binned Average σ²(x) vs I(x)")
+plt.grid(True)
+plt.show()
+
+###############################################
+# 9. Additional Statistical Comparison of I(x) and σ²(x)
+###############################################
+# Compute I(x) in two ways:
+I_values_true = np.exp(2 * u_interp)      # using the true solution
+I_values_pred = np.exp(2 * mean_pred)       # using the predicted mean
+
+# Compute Pearson correlation coefficients between I(x) and σ²(x)
+corr_true, p_value_true = pearsonr(I_values_true, var_pred)
+corr_pred, p_value_pred = pearsonr(I_values_pred, var_pred)
+
+print("\nCorrelation (I from true u vs. σ²):", corr_true, "p-value:", p_value_true)
+print("Correlation (I from predicted u vs. σ²):", corr_pred, "p-value:", p_value_pred)
+
+# Plot I(x) and σ²(x) vs x with both definitions of I(x)
+plt.figure(figsize=(10, 6))
+plt.plot(x_test_np, I_values_true, 'r-', label='I(x) from true u(x)')
+plt.plot(x_test_np, I_values_pred, 'r--', label='I(x) from predicted u(x)')
+plt.plot(x_test_np, var_pred, 'b-', label='σ²(x)')
+plt.xlabel('x')
+plt.ylabel('Value')
+plt.title('Comparison of I(x) and σ²(x) across the Domain')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Scatter Plot: I(x) vs σ²(x) using true u
+plt.figure(figsize=(8, 6))
+plt.scatter(I_values_true, var_pred, c='blue', edgecolor='k', alpha=0.7)
+plt.xlabel('I(x) [from true u]')
+plt.ylabel('σ²(x)')
+plt.title('Scatter Plot: I(x) [true] vs. σ²(x)')
+plt.grid(True)
+plt.show()
+
+# Scatter Plot: I(x) vs σ²(x) using predicted u
+plt.figure(figsize=(8, 6))
+plt.scatter(I_values_pred, var_pred, c='green', edgecolor='k', alpha=0.7)
+plt.xlabel('I(x) [from predicted u]')
+plt.ylabel('σ²(x)')
+plt.title('Scatter Plot: I(x) [predicted] vs. σ²(x)')
+plt.grid(True)
+plt.show()
+
+print("Done.")
